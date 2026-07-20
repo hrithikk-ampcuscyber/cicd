@@ -1,0 +1,102 @@
+name: Deploy Prod
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  MOCK_ENV: prod
+  IMAGE_TAG: practice-api:${{ github.sha }}
+
+jobs:
+  deploy-prod:
+    name: Mock Deploy → Prod
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkov (prod config)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/
+          framework: dockerfile,docker_compose
+          soft_fail: false
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+
+      - name: Trivy policy on digest
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_TAG }}
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Verify SBOM present
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-prod-${{ github.sha }}
+          image: ${{ env.IMAGE_TAG }}
+          format: spdx-json
+
+      - name: Mock registry push
+        run: |
+          echo "::notice::MOCK push ${{ env.IMAGE_TAG }} → mock://registry/prod/${{ github.sha }}"
+          echo "MOCK_REGISTRY=mock://registry/prod/${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Mock deploy to prod environment
+        run: |
+          docker run -d --name api -p 8000:8000 \
+            -e ENVIRONMENT=prod \
+            -e APP_VERSION=${{ github.sha }} \
+            ${{ env.IMAGE_TAG }}
+          sleep 5
+          curl -sf http://localhost:8000/health
+          echo "::notice::MOCK deployed to prod environment"
+
+      - name: Smoke / health check
+        run: |
+          HEALTH=$(curl -sf http://localhost:8000/health)
+          echo "$HEALTH"
+          echo "$HEALTH" | grep -q '"environment":"prod"'
+          echo "$HEALTH" | grep -q '"status":"ok"'
+
+      - name: Mock promote digest (prod)
+        run: echo "::notice::MOCK promote ${{ env.IMAGE_TAG }} → prod"
+
+      - name: Write deploy record
+        if: always()
+        run: |
+          mkdir -p deploy-artifacts
+          cat > deploy-artifacts/deploy-prod.json <<EOF
+          {
+            "environment": "prod",
+            "commit": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "image": "${{ env.IMAGE_TAG }}",
+            "mock_registry": "${{ env.MOCK_REGISTRY }}",
+            "promoted_tag": "prod",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "status": "simulated-success"
+          }
+          EOF
+
+      - name: Upload deploy artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-prod-${{ github.sha }}
+          path: deploy-artifacts/
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f api

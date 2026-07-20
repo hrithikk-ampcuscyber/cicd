@@ -1,0 +1,6 @@
+title: Gitleaks config
+
+[allowlist]
+paths = [
+  '''\.github/workflows/''',
+]

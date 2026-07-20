@@ -1,0 +1,153 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  lint-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy app
+
+      - name: Pytest (unit + integration)
+        run: pytest tests/unit tests/integration -v
+
+  security-scan:
+    name: Secrets, SAST & SCA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/python
+
+      - name: OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@v2
+        with:
+          scan-args: |-
+            --recursive
+            .
+            --skip-git
+
+  openapi-lint:
+    name: Spectral OpenAPI Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Spectral
+        run: npx --yes @stoplight/spectral-cli lint openapi/openapi.yaml
+
+  checkov:
+    name: Checkov IaC Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/
+          framework: dockerfile,docker_compose
+          soft_fail: false
+
+  build-scan-sbom:
+    name: Build, Trivy & SBOM
+    runs-on: ubuntu-latest
+    needs: [lint-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/Dockerfile
+          load: true
+          tags: practice-api:${{ github.sha }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: practice-api:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-pr-${{ github.sha }}
+          image: practice-api:${{ github.sha }}
+          format: spdx-json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: License compliance
+        run: |
+          pip install pip-licenses
+          pip-licenses --from=mixed --format=markdown --with-urls --output-file=licenses.md
+          pip-licenses --fail-on "GNU General Public License" --from=mixed
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: licenses-pr-${{ github.sha }}
+          path: licenses.md
+
+  smoke-light:
+    name: Light Smoke Test
+    runs-on: ubuntu-latest
+    needs: [build-scan-sbom]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run container
+        run: |
+          docker build -t practice-api:${{ github.sha }} -f infra/docker/Dockerfile .
+          docker run -d --name api -p 8000:8000 \
+            -e ENVIRONMENT=ci \
+            -e APP_VERSION=${{ github.sha }} \
+            practice-api:${{ github.sha }}
+          sleep 5
+
+      - name: Health check
+        run: curl -sf http://localhost:8000/health | tee health.json
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f api
