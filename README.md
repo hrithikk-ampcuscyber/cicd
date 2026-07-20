@@ -49,28 +49,53 @@ BASE_URL=http://localhost:8000 pytest tests/e2e -v -m e2e
 
 ## CI/CD pipelines
 
+### CodeQL (`codeql.yml`) — PRs and pushes to `dev`
+
+GitHub-native SAST; SARIF uploaded to **Security → Code scanning**.
+
 ### PR Checks (`pr-checks.yml`) — PRs to `dev`
 
-| Job | Tools |
-|-----|-------|
-| lint-test | Ruff, Mypy, Pytest |
-| security-scan | Gitleaks, Semgrep, OSV-Scanner |
-| openapi-lint | Spectral |
-| checkov | Checkov (Dockerfile + compose) |
-| build-scan-sbom | Docker build, Trivy, Syft SBOM, pip-licenses |
-| smoke-light | Docker run + curl `/health` |
+| Job | Tools | Reports |
+|-----|-------|---------|
+| dependency-review | GitHub Dependency Review | PR comment summary |
+| lint-test | Ruff lint/format, Mypy, Pytest+coverage | JUnit XML, Cobertura XML |
+| security-scan | Gitleaks, Semgrep, OSV-Scanner, pip-audit | SARIF + JSON |
+| openapi-lint | Spectral | JSON |
+| checkov | Checkov (Dockerfile + compose) | SARIF |
+| build-scan-sbom | Hadolint, Trivy fs/image, Syft SBOM, pip-licenses | SARIF, JSON, SPDX, CycloneDX, CSV |
+| smoke-light | Docker run + health | JSON |
+| aggregate-reports | Pipeline summary generator | Consolidated artifact (90-day retention) |
+
+SARIF files are uploaded to **Security → Code scanning alerts**.
 
 ### Deploy Test (`deploy-test.yml`) — push to `dev`
 
-Build → Trivy → SBOM → mock deploy → Schemathesis → OWASP ZAP → E2E → promote `test-approved` artifact.
+Build → Trivy (SARIF+JSON) → SBOM → mock deploy → Schemathesis (JUnit) → OWASP ZAP (HTML+JSON) → E2E (JUnit) → `security-reports-test-<sha>` artifact.
 
 ### Deploy Demo (`deploy-demo.yml`) — push to `release/**`
 
-Same as test plus Checkov env scan. Promotes `demo-approved` artifact.
+Same as test plus Checkov SARIF. Artifact: `security-reports-demo-<sha>`.
 
 ### Deploy Prod (`deploy-prod.yml`) — push to `main`
 
-Checkov → Trivy (CRITICAL only) → SBOM verify → mock deploy → smoke only (no ZAP) → promote `prod` artifact.
+Checkov SARIF → Trivy CRITICAL (SARIF+JSON) → SBOM verify → mock deploy → smoke only (no ZAP) → `security-reports-prod-<sha>` artifact.
+
+## Report artifacts (IT standard)
+
+Each pipeline run produces a **`security-reports-<sha>`** artifact containing:
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `*.sarif` | SARIF 2.1 | SAST, SCA, secrets, container, IaC (also in Security tab) |
+| `junit-*.xml` | JUnit | Test results in GitHub Checks |
+| `coverage.xml` | Cobertura | Code coverage |
+| `sbom.spdx.json` | SPDX | Software Bill of Materials |
+| `sbom.cyclonedx.json` | CycloneDX | Alternative SBOM format |
+| `trivy-*.json` | JSON | Vulnerability scan archive |
+| `licenses.csv/json/md` | Multi | License compliance |
+| `zap-report.html/json` | HTML/JSON | DAST results (test/demo only) |
+| `pipeline-summary.json` | JSON | Consolidated audit manifest |
+| `deploy-*.json` | JSON | Mock deployment record |
 
 ## Practice workflow
 
@@ -101,4 +126,4 @@ Create environments in **Settings → Environments**: `test`, `demo`, `productio
 
 ## Mock deploy artifacts
 
-Each deploy workflow uploads a JSON file under **Actions → run → Artifacts**, e.g. `deploy-test-<sha>/deploy-test.json`.
+Each deploy workflow uploads a **`security-reports-<env>-<sha>`** bundle (see table above). The deploy manifest JSON is included as `deploy-<env>.json`.
