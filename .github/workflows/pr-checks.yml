@@ -7,55 +7,152 @@ on:
 permissions:
   contents: read
   security-events: write
-  pull-requests: read
+  actions: read
+  pull-requests: write
+  checks: write
+
+env:
+  REPORTS_DIR: reports
+  PYTHON_VERSION: "3.12"
 
 jobs:
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: always
+
   lint-test:
-    name: Lint & Unit Tests
+    name: Lint, Format & Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
 
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
-      - name: Ruff
+      - name: Ruff lint
         run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
 
       - name: Mypy
         run: mypy app
 
-      - name: Pytest (unit + integration)
-        run: pytest tests/unit tests/integration -v
+      - name: Pytest with coverage
+        run: |
+          pytest tests/unit tests/integration -v \
+            --junitxml="${{ env.REPORTS_DIR }}/junit-unit.xml" \
+            --cov=app \
+            --cov-report=xml:"${{ env.REPORTS_DIR }}/coverage.xml" \
+            --cov-report=term-missing
+
+      - name: Upload lint/test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-lint-test-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
 
   security-scan:
     name: Secrets, SAST & SCA
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Semgrep
-        uses: semgrep/semgrep-action@v1
         with:
-          config: p/python
+          fetch-depth: 0
 
-      - name: OSV-Scanner
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.22.1/gitleaks_8.22.1_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+
+      - name: Gitleaks secret scan
+        run: |
+          ./gitleaks detect \
+            --source . \
+            --config .gitleaks.toml \
+            --report-format sarif \
+            --report-path "${{ env.REPORTS_DIR }}/gitleaks.sarif" \
+            --redact \
+            --verbose
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Semgrep SAST
+        run: |
+          pip install semgrep
+          semgrep scan \
+            --config p/python \
+            --sarif \
+            --sarif-output="${{ env.REPORTS_DIR }}/semgrep.sarif" \
+            --error
+
+      - name: OSV-Scanner SCA
         uses: google/osv-scanner-action/osv-scanner-action@v2
         with:
           scan-args: |-
             --recursive
+            --format=sarif
+            --output=${{ env.REPORTS_DIR }}/osv.sarif
             .
             --skip-git
+
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json -o "${{ env.REPORTS_DIR }}/pip-audit.json"
+
+      - name: Upload Gitleaks SARIF
+        if: always() && hashFiles('reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload Semgrep SARIF
+        if: always() && hashFiles('reports/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      - name: Upload OSV SARIF
+        if: always() && hashFiles('reports/osv.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/osv.sarif
+          category: osv-scanner
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-security-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
 
   openapi-lint:
     name: Spectral OpenAPI Lint
@@ -67,8 +164,22 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Spectral
-        run: npx --yes @stoplight/spectral-cli lint openapi/openapi.yaml
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Spectral lint
+        run: |
+          npx --yes @stoplight/spectral-cli lint openapi/openapi.yaml \
+            --format json \
+            --output "${{ env.REPORTS_DIR }}/spectral.json"
+
+      - name: Upload OpenAPI reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-openapi-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
 
   checkov:
     name: Checkov IaC Scan
@@ -76,19 +187,60 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkov
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Checkov scan
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: infra/
           framework: dockerfile,docker_compose
+          output_format: sarif
+          output_file_path: ${{ env.REPORTS_DIR }}/checkov.sarif
           soft_fail: false
 
+      - name: Upload Checkov SARIF
+        if: always() && hashFiles('reports/checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/checkov.sarif
+          category: checkov
+
+      - name: Upload IaC reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-checkov-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
+
   build-scan-sbom:
-    name: Build, Trivy & SBOM
+    name: Build, Trivy, Hadolint & SBOM
     runs-on: ubuntu-latest
     needs: [lint-test]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Hadolint Dockerfile lint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: infra/docker/Dockerfile
+          format: json
+          output-file: ${{ env.REPORTS_DIR }}/hadolint.json
+          failure-threshold: warning
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: ${{ env.REPORTS_DIR }}/trivy-fs.json
+          severity: CRITICAL,HIGH
+          exit-code: "1"
 
       - name: Build Docker image
         uses: docker/build-push-action@v6
@@ -98,36 +250,69 @@ jobs:
           load: true
           tags: practice-api:${{ github.sha }}
 
-      - name: Trivy image scan
+      - name: Trivy image scan (SARIF)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: practice-api:${{ github.sha }}
-          format: table
+          format: sarif
+          output: ${{ env.REPORTS_DIR }}/trivy-image.sarif
           severity: CRITICAL,HIGH
           exit-code: "1"
 
-      - name: Generate SBOM
+      - name: Trivy image scan (JSON)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: practice-api:${{ github.sha }}
+          format: json
+          output: ${{ env.REPORTS_DIR }}/trivy-image.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          artifact-name: sbom-pr-${{ github.sha }}
+          artifact-name: sbom-spdx-pr-${{ github.sha }}
+          output-file: ${{ env.REPORTS_DIR }}/sbom.spdx.json
           image: practice-api:${{ github.sha }}
           format: spdx-json
 
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-cyclonedx-pr-${{ github.sha }}
+          output-file: ${{ env.REPORTS_DIR }}/sbom.cyclonedx.json
+          image: practice-api:${{ github.sha }}
+          format: cyclonedx-json
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: License compliance
         run: |
           pip install pip-licenses
-          pip-licenses --from=mixed --format=markdown --with-urls --output-file=licenses.md
+          pip-licenses --from=mixed --format=markdown --with-urls \
+            --output-file="${{ env.REPORTS_DIR }}/licenses.md"
+          pip-licenses --from=mixed --format=csv \
+            --output-file="${{ env.REPORTS_DIR }}/licenses.csv"
+          pip-licenses --from=mixed --format=json \
+            --output-file="${{ env.REPORTS_DIR }}/licenses.json"
           pip-licenses --fail-on "GNU General Public License" --from=mixed
 
-      - name: Upload license report
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('reports/trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload build/scan reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: licenses-pr-${{ github.sha }}
-          path: licenses.md
+          name: reports-build-scan-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
 
   smoke-light:
     name: Light Smoke Test
@@ -135,6 +320,9 @@ jobs:
     needs: [build-scan-sbom]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
 
       - name: Build and run container
         run: |
@@ -146,8 +334,70 @@ jobs:
           sleep 5
 
       - name: Health check
-        run: curl -sf http://localhost:8000/health | tee health.json
+        run: |
+          curl -sf http://localhost:8000/health | tee "${{ env.REPORTS_DIR }}/health-smoke.json"
 
       - name: Stop container
         if: always()
         run: docker rm -f api
+
+      - name: Upload smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-smoke-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          if-no-files-found: warn
+
+  aggregate-reports:
+    name: Aggregate Security Reports
+    runs-on: ubuntu-latest
+    needs:
+      - dependency-review
+      - lint-test
+      - security-scan
+      - openapi-lint
+      - checkov
+      - build-scan-sbom
+      - smoke-light
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*-${{ github.sha }}
+          merge-multiple: true
+          path: all-reports
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Generate pipeline summary
+        run: |
+          python .github/scripts/generate-pipeline-summary.py \
+            --reports-dir all-reports \
+            --workflow "PR Checks" \
+            --environment ci \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --ref "${{ github.ref }}" \
+            --output all-reports/pipeline-summary.json
+
+      - name: Upload consolidated security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.sha }}
+          path: all-reports/
+          retention-days: 90
+
+      - name: Publish test results
+        if: always() && hashFiles('all-reports/junit-unit.xml') != ''
+        uses: dorny/test-reporter@v1
+        with:
+          name: Unit & Integration Tests
+          path: all-reports/junit-unit.xml
+          reporter: java-junit
+          fail-on-error: true
