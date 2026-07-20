@@ -6,10 +6,14 @@ on:
 
 permissions:
   contents: read
+  security-events: write
+  checks: write
 
 env:
   MOCK_ENV: prod
   IMAGE_TAG: practice-api:${{ github.sha }}
+  REPORTS_DIR: reports
+  PYTHON_VERSION: "3.12"
 
 jobs:
   deploy-prod:
@@ -19,12 +23,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
       - name: Checkov (prod config)
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: infra/
           framework: dockerfile,docker_compose
+          output_format: sarif
+          output_file_path: ${{ env.REPORTS_DIR }}/checkov.sarif
           soft_fail: false
+
+      - name: Upload Checkov SARIF
+        if: always() && hashFiles('reports/checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/checkov.sarif
+          category: checkov-prod
 
       - name: Build Docker image
         uses: docker/build-push-action@v6
@@ -34,19 +50,46 @@ jobs:
           load: true
           tags: ${{ env.IMAGE_TAG }}
 
-      - name: Trivy policy on digest
+      - name: Trivy policy on digest (SARIF)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.IMAGE_TAG }}
+          format: sarif
+          output: ${{ env.REPORTS_DIR }}/trivy-image.sarif
           severity: CRITICAL
           exit-code: "1"
 
-      - name: Verify SBOM present
+      - name: Trivy policy on digest (JSON)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: json
+          output: ${{ env.REPORTS_DIR }}/trivy-image.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - name: Verify SBOM (SPDX)
         uses: anchore/sbom-action@v0
         with:
-          artifact-name: sbom-prod-${{ github.sha }}
+          artifact-name: sbom-spdx-prod-${{ github.sha }}
+          output-file: ${{ env.REPORTS_DIR }}/sbom.spdx.json
           image: ${{ env.IMAGE_TAG }}
           format: spdx-json
+
+      - name: Verify SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-cyclonedx-prod-${{ github.sha }}
+          output-file: ${{ env.REPORTS_DIR }}/sbom.cyclonedx.json
+          image: ${{ env.IMAGE_TAG }}
+          format: cyclonedx-json
+
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('reports/trivy-image.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-prod
 
       - name: Mock registry push
         run: |
@@ -60,24 +103,23 @@ jobs:
             -e APP_VERSION=${{ github.sha }} \
             ${{ env.IMAGE_TAG }}
           sleep 5
-          curl -sf http://localhost:8000/health
+          curl -sf http://localhost:8000/health | tee "${{ env.REPORTS_DIR }}/health-deploy.json"
           echo "::notice::MOCK deployed to prod environment"
 
       - name: Smoke / health check
         run: |
           HEALTH=$(curl -sf http://localhost:8000/health)
-          echo "$HEALTH"
+          echo "$HEALTH" | tee "${{ env.REPORTS_DIR }}/health-smoke.json"
           echo "$HEALTH" | grep -q '"environment":"prod"'
           echo "$HEALTH" | grep -q '"status":"ok"'
 
       - name: Mock promote digest (prod)
         run: echo "::notice::MOCK promote ${{ env.IMAGE_TAG }} → prod"
 
-      - name: Write deploy record
+      - name: Write deploy manifest
         if: always()
         run: |
-          mkdir -p deploy-artifacts
-          cat > deploy-artifacts/deploy-prod.json <<EOF
+          cat > "${{ env.REPORTS_DIR }}/deploy-prod.json" <<EOF
           {
             "environment": "prod",
             "commit": "${{ github.sha }}",
@@ -90,12 +132,30 @@ jobs:
           }
           EOF
 
-      - name: Upload deploy artifact
+      - uses: actions/setup-python@v5
+        if: always()
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Generate pipeline summary
+        if: always()
+        run: |
+          python .github/scripts/generate-pipeline-summary.py \
+            --reports-dir "${{ env.REPORTS_DIR }}" \
+            --workflow "Deploy Prod" \
+            --environment prod \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --ref "${{ github.ref }}" \
+            --output "${{ env.REPORTS_DIR }}/pipeline-summary.json"
+
+      - name: Upload consolidated security reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: deploy-prod-${{ github.sha }}
-          path: deploy-artifacts/
+          name: security-reports-prod-${{ github.sha }}
+          path: ${{ env.REPORTS_DIR }}/
+          retention-days: 90
 
       - name: Stop container
         if: always()
